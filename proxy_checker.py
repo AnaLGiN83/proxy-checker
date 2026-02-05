@@ -22,7 +22,7 @@ except ImportError:
 
 class ProxyStatus(Enum):
     OK = "OK"
-    SLOW = "SLOW (possible censorship)"
+    TLS_FREEZE = "TLS_FREEZE (censorship detected)"
     TIMEOUT = "TIMEOUT"
     ERROR = "ERROR"
     AUTH_FAILED = "AUTH_FAILED"
@@ -33,7 +33,7 @@ class ProxyResult:
     proxy: str
     status: ProxyStatus
     response_time: Optional[float] = None
-    download_speed: Optional[float] = None  # KB/s
+    bytes_before_freeze: Optional[int] = None  # Bytes downloaded before freeze
     error_message: Optional[str] = None
     ip_address: Optional[str] = None
 
@@ -91,30 +91,87 @@ def load_proxies(filepath: str) -> list[ProxyConfig]:
     return proxies
 
 
+# TLS freeze detection constants
+FREEZE_MIN_BYTES = 14 * 1024  # 14KB - lower bound for freeze detection
+FREEZE_MAX_BYTES = 25 * 1024  # 25KB - upper bound for freeze detection  
+FREEZE_STALL_TIMEOUT = 5.0    # Seconds without data to consider it a freeze
+CHUNK_SIZE = 1024             # Read in small chunks for precise detection
+
+
+async def check_tls_freeze(
+    session: aiohttp.ClientSession,
+    proxy: ProxyConfig,
+    test_url: str,
+    total_timeout: float = 30.0,
+) -> tuple[bool, int]:
+    """
+    Checks for TLS freeze pattern - when connection stalls after 16-20KB.
+    
+    Returns:
+        (is_frozen, bytes_downloaded)
+    """
+    downloaded_bytes = 0
+    last_chunk_time = time.perf_counter()
+    
+    try:
+        async with session.get(
+            test_url,
+            proxy=proxy.url,
+            ssl=True,  # Use TLS
+            timeout=aiohttp.ClientTimeout(total=total_timeout, sock_read=FREEZE_STALL_TIMEOUT + 1)
+        ) as response:
+            if response.status != 200:
+                return False, 0
+            
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        response.content.read(CHUNK_SIZE),
+                        timeout=FREEZE_STALL_TIMEOUT
+                    )
+                    
+                    if not chunk:
+                        # Download completed successfully
+                        return False, downloaded_bytes
+                    
+                    downloaded_bytes += len(chunk)
+                    last_chunk_time = time.perf_counter()
+                    
+                except asyncio.TimeoutError:
+                    # Stall detected - check if it's in the freeze range
+                    if FREEZE_MIN_BYTES <= downloaded_bytes <= FREEZE_MAX_BYTES:
+                        return True, downloaded_bytes
+                    # Stall outside freeze range - just timeout
+                    return False, downloaded_bytes
+                    
+    except asyncio.TimeoutError:
+        # Check if stall happened in freeze range
+        if FREEZE_MIN_BYTES <= downloaded_bytes <= FREEZE_MAX_BYTES:
+            return True, downloaded_bytes
+        return False, downloaded_bytes
+    except Exception:
+        return False, downloaded_bytes
+
+
 async def check_proxy(
     proxy: ProxyConfig,
     timeout_connect: float = 10.0,
     timeout_total: float = 30.0,
-    slow_threshold_time: float = 15.0,
-    slow_threshold_speed: float = 10.0,  # KB/s - below this is considered slow
 ) -> ProxyResult:
     """
-    Checks proxy for functionality and speed.
+    Checks proxy for functionality and TLS freeze (censorship).
     
-    Censorship/throttling detection criteria:
-    - Response time > slow_threshold_time seconds
-    - Download speed < slow_threshold_speed KB/s
+    TLS freeze detection:
+    - Downloads data through HTTPS
+    - Detects if connection stalls after ~16-20KB (characteristic of DPI censorship)
     """
     test_urls = [
         ("https://httpbin.org/ip", "origin"),  # Returns IP
         ("https://api.ipify.org?format=json", "ip"),  # Alternative service
     ]
 
-    # Speed test - using multiple URLs for reliability
-    speed_test_urls = [
-        "https://www.google.com/",  # ~15KB
-        "https://httpbin.org/bytes/51200",  # 50KB
-    ]
+    # URL for TLS freeze test - needs to return enough data (>25KB)
+    freeze_test_url = "https://httpbin.org/bytes/102400"  # 100KB
 
     connector = aiohttp.TCPConnector(limit=1, force_close=True)
     timeout = aiohttp.ClientTimeout(
@@ -136,7 +193,7 @@ async def check_proxy(
                     async with session.get(
                         test_url,
                         proxy=proxy.url,
-                        ssl=False
+                        ssl=True
                     ) as response:
                         if response.status == 407:
                             return ProxyResult(
@@ -161,53 +218,25 @@ async def check_proxy(
                     error_message="Failed to get IP through proxy"
                 )
 
-            # Test 2: Download speed check
-            download_speed = None
-            
-            for speed_url in speed_test_urls:
-                speed_start = time.perf_counter()
-                downloaded_bytes = 0
-                
-                try:
-                    async with session.get(
-                        speed_url,
-                        proxy=proxy.url,
-                        ssl=False,
-                        timeout=aiohttp.ClientTimeout(total=20)
-                    ) as response:
-                        if response.status == 200:
-                            async for chunk in response.content.iter_chunked(8192):
-                                downloaded_bytes += len(chunk)
-                            
-                            speed_time = time.perf_counter() - speed_start
-                            if speed_time > 0 and downloaded_bytes > 0:
-                                download_speed = (downloaded_bytes / 1024) / speed_time
-                                break  # Success, exit loop
-                except asyncio.TimeoutError:
-                    continue  # Try next URL
-                except Exception:
-                    continue
+            # Test 2: TLS freeze detection
+            is_frozen, bytes_downloaded = await check_tls_freeze(
+                session, proxy, freeze_test_url, timeout_total
+            )
 
-            # Determine status
-            total_time = time.perf_counter() - start_time
-
-            # Proxy is considered slow if:
-            # 1. Total time > threshold AND speed is measured and low
-            # 2. OR speed is measured and very low (< threshold)
-            is_slow = False
-            if download_speed is not None:
-                if download_speed < slow_threshold_speed:
-                    is_slow = True
-            if total_time > slow_threshold_time:
-                is_slow = True
-
-            status = ProxyStatus.SLOW if is_slow else ProxyStatus.OK
+            if is_frozen:
+                return ProxyResult(
+                    proxy=str(proxy),
+                    status=ProxyStatus.TLS_FREEZE,
+                    response_time=response_time,
+                    bytes_before_freeze=bytes_downloaded,
+                    ip_address=ip_address,
+                    error_message=f"TLS freeze at {bytes_downloaded/1024:.1f}KB"
+                )
 
             return ProxyResult(
                 proxy=str(proxy),
-                status=status,
+                status=ProxyStatus.OK,
                 response_time=response_time,
-                download_speed=download_speed,
                 ip_address=ip_address
             )
 
@@ -240,11 +269,11 @@ async def check_proxy(
 def print_result(result: ProxyResult, verbose: bool = False) -> None:
     """Prints proxy check result"""
     status_colors = {
-        ProxyStatus.OK: "\033[92m",       # Green
-        ProxyStatus.SLOW: "\033[93m",     # Yellow
-        ProxyStatus.TIMEOUT: "\033[91m",  # Red
-        ProxyStatus.ERROR: "\033[91m",    # Red
-        ProxyStatus.AUTH_FAILED: "\033[91m"  # Red
+        ProxyStatus.OK: "\033[92m",           # Green
+        ProxyStatus.TLS_FREEZE: "\033[91m",   # Red - censorship
+        ProxyStatus.TIMEOUT: "\033[91m",      # Red
+        ProxyStatus.ERROR: "\033[91m",        # Red
+        ProxyStatus.AUTH_FAILED: "\033[91m"   # Red
     }
     reset = "\033[0m"
 
@@ -258,8 +287,8 @@ def print_result(result: ProxyResult, verbose: bool = False) -> None:
             print(f"  └─ IP: {result.ip_address}")
         if result.response_time is not None:
             print(f"  └─ Response time: {result.response_time:.2f}s")
-        if result.download_speed is not None:
-            print(f"  └─ Download speed: {result.download_speed:.1f} KB/s")
+        if result.bytes_before_freeze is not None:
+            print(f"  └─ Bytes before freeze: {result.bytes_before_freeze/1024:.1f} KB")
         if result.error_message:
             print(f"  └─ Error: {result.error_message}")
 
@@ -269,8 +298,6 @@ async def check_proxies(
     concurrency: int = 5,
     timeout_connect: float = 10.0,
     timeout_total: float = 30.0,
-    slow_threshold_time: float = 15.0,
-    slow_threshold_speed: float = 50.0,
     verbose: bool = False
 ) -> list[ProxyResult]:
     """Checks proxy list with limited concurrent requests"""
@@ -284,8 +311,6 @@ async def check_proxies(
                 proxy,
                 timeout_connect=timeout_connect,
                 timeout_total=timeout_total,
-                slow_threshold_time=slow_threshold_time,
-                slow_threshold_speed=slow_threshold_speed
             )
             # Clear line and print result
             print("\r" + " " * 50 + "\r", end="")
@@ -302,25 +327,23 @@ def print_summary(results: list[ProxyResult]) -> None:
     """Prints summary statistics"""
     total = len(results)
     ok = sum(1 for r in results if r.status == ProxyStatus.OK)
-    slow = sum(1 for r in results if r.status == ProxyStatus.SLOW)
+    tls_freeze = sum(1 for r in results if r.status == ProxyStatus.TLS_FREEZE)
     timeout = sum(1 for r in results if r.status == ProxyStatus.TIMEOUT)
     errors = sum(1 for r in results if r.status in (ProxyStatus.ERROR, ProxyStatus.AUTH_FAILED))
 
     print("\n" + "=" * 50)
     print("SUMMARY:")
     print(f"  Total checked: {total}")
-    print(f"  \033[92mWorking (OK):    {ok}\033[0m")
-    print(f"  \033[93mSlow (SLOW):     {slow}\033[0m")
-    print(f"  \033[91mTimeout:         {timeout}\033[0m")
-    print(f"  \033[91mErrors:          {errors}\033[0m")
+    print(f"  \033[92mWorking (OK):       {ok}\033[0m")
+    print(f"  \033[91mTLS Freeze (censor): {tls_freeze}\033[0m")
+    print(f"  \033[91mTimeout:            {timeout}\033[0m")
+    print(f"  \033[91mErrors:             {errors}\033[0m")
     print("=" * 50)
 
 
-def save_working_proxies(results: list[ProxyResult], output_file: str, include_slow: bool = False) -> None:
+def save_working_proxies(results: list[ProxyResult], output_file: str) -> None:
     """Saves working proxies to file"""
     working = [r for r in results if r.status == ProxyStatus.OK]
-    if include_slow:
-        working.extend([r for r in results if r.status == ProxyStatus.SLOW])
 
     with open(output_file, 'w', encoding='utf-8') as f:
         for result in working:
@@ -331,13 +354,17 @@ def save_working_proxies(results: list[ProxyResult], output_file: str, include_s
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Proxy Checker - checks proxy functionality with censorship detection",
+        description="Proxy Checker - checks proxy functionality with TLS freeze (censorship) detection",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Usage examples:
   python proxy_checker.py proxy-list.txt
   python proxy_checker.py proxy-list.txt -c 10 -v
-  python proxy_checker.py proxy-list.txt --timeout 60 --slow-time 20
+  python proxy_checker.py proxy-list.txt --timeout 60
+
+TLS Freeze Detection:
+  Detects censorship by identifying connections that stall after ~16-20KB
+  of TLS traffic - a characteristic pattern of DPI-based blocking.
         """
     )
 
@@ -369,26 +396,9 @@ Usage examples:
         help="Total timeout in seconds (default: 30)"
     )
     parser.add_argument(
-        "--slow-time",
-        type=float,
-        default=15.0,
-        help="Time threshold for slow proxy detection in seconds (default: 15)"
-    )
-    parser.add_argument(
-        "--slow-speed",
-        type=float,
-        default=50.0,
-        help="Speed threshold for slow proxy detection in KB/s (default: 50)"
-    )
-    parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         help="Verbose output"
-    )
-    parser.add_argument(
-        "--include-slow",
-        action="store_true",
-        help="Include slow proxies in working list when saving"
     )
 
     args = parser.parse_args()
@@ -401,7 +411,7 @@ Usage examples:
 
     print(f"Loaded {len(proxies)} proxies for checking")
     print(f"Parameters: concurrency={args.concurrency}, timeout={args.timeout}s")
-    print(f"Censorship thresholds: time>{args.slow_time}s or speed<{args.slow_speed}KB/s")
+    print(f"TLS freeze detection: stall at {FREEZE_MIN_BYTES//1024}-{FREEZE_MAX_BYTES//1024}KB after {FREEZE_STALL_TIMEOUT}s")
     print("-" * 50)
 
     # Check proxies
@@ -410,8 +420,6 @@ Usage examples:
         concurrency=args.concurrency,
         timeout_connect=args.timeout_connect,
         timeout_total=args.timeout,
-        slow_threshold_time=args.slow_time,
-        slow_threshold_speed=args.slow_speed,
         verbose=args.verbose
     ))
 
@@ -420,7 +428,7 @@ Usage examples:
 
     # Save results
     if args.output:
-        save_working_proxies(results, args.output, args.include_slow)
+        save_working_proxies(results, args.output)
 
 
 if __name__ == "__main__":

@@ -1,25 +1,18 @@
 # Proxy Checker
 
-Cross-platform proxy checker with censorship/throttling detection.
+Cross-platform proxy checker with **TLS freeze (censorship) detection**.
 
 ## Features
 
 - **Proxy validation** — verifies proxy connectivity and retrieves external IP
-- **Speed measurement** — measures download speed through proxy
-- **Censorship detection** — detects traffic throttling (slow connections that "load forever")
+- **TLS freeze detection** — detects DPI-based censorship by identifying connections that stall after ~16-20KB
 - **Concurrent checking** — checks multiple proxies in parallel
-- **Color-coded output** — visual status indication (green/yellow/red)
+- **Color-coded output** — visual status indication (green/red)
 
 ## Installation
 
 ```bash
 pip install -r requirements.txt
-```
-
-Or install directly:
-
-```bash
-pip install aiohttp
 ```
 
 ## Usage
@@ -39,8 +32,8 @@ python proxy_checker.py proxy-list.txt -c 10 -v
 # Save working proxies to file
 python proxy_checker.py proxy-list.txt -o working.txt
 
-# Custom thresholds
-python proxy_checker.py proxy-list.txt --timeout 60 --slow-time 20 --slow-speed 30
+# Custom timeout
+python proxy_checker.py proxy-list.txt --timeout 60
 ```
 
 ### Command Line Arguments
@@ -52,10 +45,7 @@ python proxy_checker.py proxy-list.txt --timeout 60 --slow-time 20 --slow-speed 
 | `-c, --concurrency` | Number of concurrent checks | 5 |
 | `--timeout-connect` | Connection timeout (seconds) | 10 |
 | `--timeout` | Total timeout (seconds) | 30 |
-| `--slow-time` | Time threshold for slow detection (seconds) | 15 |
-| `--slow-speed` | Speed threshold for slow detection (KB/s) | 50 |
 | `-v, --verbose` | Verbose output | false |
-| `--include-slow` | Include slow proxies when saving | false |
 
 ## Proxy File Format
 
@@ -79,42 +69,50 @@ Lines starting with `#` are treated as comments.
 | Status | Color | Description |
 |--------|-------|-------------|
 | **OK** | 🟢 Green | Proxy works normally |
-| **SLOW** | 🟡 Yellow | Proxy works but slow (possible censorship/throttling) |
+| **TLS_FREEZE** | 🔴 Red | Censorship detected (connection stalled at 16-20KB) |
 | **TIMEOUT** | 🔴 Red | Connection timed out |
 | **ERROR** | 🔴 Red | Connection or other error |
 | **AUTH_FAILED** | 🔴 Red | Proxy authentication failed |
 
-## Censorship Detection
+## TLS Freeze Detection
 
-The tool detects potential censorship/throttling when:
+The tool detects DPI-based censorship by identifying a characteristic pattern:
 
-1. **Response time** exceeds the threshold (default: 15 seconds)
-2. **Download speed** falls below the threshold (default: 50 KB/s)
+**TLS connections that stall after ~16-20KB of data transfer.**
 
-These thresholds can be adjusted via `--slow-time` and `--slow-speed` arguments.
+This is a common behavior of Deep Packet Inspection (DPI) systems that:
+1. Allow the TLS handshake to complete
+2. Start passing encrypted data
+3. Then block/throttle the connection after analyzing initial packets
+
+The detection works by:
+- Downloading data through HTTPS (TLS)
+- Monitoring for stalls (no data for 5+ seconds)
+- Flagging connections that freeze in the 14-25KB range
 
 ## Example Output
 
 ```
-Loaded 3 proxies for checking
+Loaded 2 proxies for checking
 Parameters: concurrency=5, timeout=30.0s
-Censorship thresholds: time>15.0s or speed<50.0KB/s
+TLS freeze detection: stall at 14-25KB after 5.0s
 --------------------------------------------------
 proxy1.example.com:8080: [OK]
-proxy2.example.com:3128: [SLOW (possible censorship)]
   └─ IP: 203.0.113.45
-  └─ Response time: 18.34s
-  └─ Download speed: 12.5 KB/s
-proxy3.example.com:1080: [TIMEOUT]
-  └─ Error: Connection timeout (30.0s)
+  └─ Response time: 1.65s
+proxy2.example.com:3128: [TLS_FREEZE (censorship detected)]
+  └─ IP: 151.236.165.163
+  └─ Response time: 3.25s
+  └─ Bytes before freeze: 17.5 KB
+  └─ Error: TLS freeze at 17.5KB
 
 ==================================================
 SUMMARY:
-  Total checked: 3
-  Working (OK):    1
-  Slow (SLOW):     1
-  Timeout:         1
-  Errors:          0
+  Total checked: 2
+  Working (OK):       1
+  TLS Freeze (censor): 1
+  Timeout:            0
+  Errors:             0
 ==================================================
 ```
 
